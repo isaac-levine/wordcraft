@@ -124,7 +124,9 @@ pub fn parse_measure(s: &str, default: Unit) -> Option<f32> {
         "px" => 0.75,
         _ => return None,
     };
-    Some(v * k)
+    // A huge value times a unit factor can overflow to infinity, so check the product too.
+    let pt = v * k;
+    pt.is_finite().then_some(pt)
 }
 
 /// A point in page space (points, y down).
@@ -324,6 +326,10 @@ mod tests {
         assert_eq!(parse_measure("1.5\"", Unit::Centimeters), Some(108.0));
         assert_eq!(parse_measure("\u{2212}1 in", Unit::Points), Some(-72.0));
         assert_eq!(parse_measure("1,2,3", Unit::Inches), None);
+        // Finite as a number, infinite once converted to points.
+        assert_eq!(parse_measure("3e38 in", Unit::Points), None);
+        assert_eq!(parse_measure("340282300000000000000000000000000000000 in", Unit::Points), None);
+        assert_eq!(parse_measure("-340282300000000000000000000000000000000 cm", Unit::Points), None);
     }
 
     #[test]

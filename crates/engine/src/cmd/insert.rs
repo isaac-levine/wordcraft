@@ -790,12 +790,12 @@ fn page_number(s: &mut Session, v: &Value) -> CmdResult {
     para.props.tabs = Some(vec![TabStop { pos: 0.0, align: TabAlign::Clear, leader: Default::default() }]);
     if x_of_y {
         para.insert_text(0, "Page  of ", &CharProps::default())?;
-        para.insert_object(5, field, &CharProps { bold: Some(true), ..Default::default() })?;
+        para.insert_object(5, field, &CharProps::default())?;
         let end = para.len();
         para.insert_object(
             end,
             InlineObject::Field { instr: "NUMPAGES".into(), result: "1".into(), locked: false, dirty: false, code: false, form: String::new() },
-            &CharProps { bold: Some(true), ..Default::default() },
+            &CharProps::default(),
         )?;
     } else {
         para.insert_object(0, field, &CharProps::default())?;
@@ -982,6 +982,18 @@ fn cover_page(s: &mut Session, v: &Value) -> CmdResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// "Page X of Y" takes the footer style's formatting; the PAGE and NUMPAGES runs carry no
+    /// direct bold (#3580).
+    #[test]
+    fn page_x_of_y_is_not_bold() {
+        let mut s = Session::new(wordcraft_doc::Document::new());
+        let out = s.run("insert.pageNumber", &json!({"position": "bottom", "format": "x of y"})).unwrap();
+        let id = out["story"].as_u64().unwrap() as _;
+        let blocks = s.doc.story(StoryRef::Part(id)).unwrap();
+        let para = blocks.first().and_then(|b| b.as_para()).unwrap();
+        assert!(para.runs.iter().all(|r| r.props.bold.is_none()), "{:?}", para.runs);
+    }
 
     /// Closing the header or footer (Esc, the ribbon) puts the caret back where it was in the
     /// body, not on page 1 (#3331).

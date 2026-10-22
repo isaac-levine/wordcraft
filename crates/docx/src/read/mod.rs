@@ -5,36 +5,52 @@ pub(crate) mod diagram;
 mod drawing_color;
 mod embed;
 mod freeform;
-mod math;
+mod glossary;
+pub(crate) mod math;
 mod props;
 mod sdt;
+mod shape_style;
 mod story;
 mod wordart;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
+use wordcraft_doc::control::{ControlEvent, ControlKind, control_events, pair_events};
 use wordcraft_doc::graphic::{Graphic, GraphicKind};
 use wordcraft_doc::numbering::{AbstractNum, Level, LevelSuffix, Num};
 use wordcraft_doc::para::NoteKind;
 use wordcraft_doc::para::OBJ;
 use wordcraft_doc::props::Rgb;
+use wordcraft_doc::props::VAlign;
 use wordcraft_doc::section::NumFormat;
-use wordcraft_doc::styles::{Style, StyleKind, StyleSheet, TableStyleParts};
-use wordcraft_doc::{Block, Blocks, Comment, Document, InlineObject, Paragraph, PartKind, Revision, RevisionKind, para_block};
+use wordcraft_doc::styles::{PartFormat, Style, StyleKind, StyleSheet, TablePart, TableStyleParts};
+use wordcraft_doc::{
+    Block, Blocks, Comment, Document, InlineObject, PagePicture, Paragraph, PartKind, Revision, RevisionKind, Zoom, ZoomFit, para_block,
+};
 
 use crate::DocxError;
+use crate::bibliography::{MAX_SOURCES, Seen};
 use crate::package::{ContentTypes, EMBEDDED_PARTS, EmbeddedManifest, MAX_VBA_RELATED, Package, Rels, VBA_PROJECT_PART, VBA_RELATED, rel_is, rt};
 use crate::units::{flag, int, on_off, tw, u32_of};
 use crate::xml::El;
 pub(crate) use props::PropCtx;
 use story::StoryCtx;
 
+/// Most fonts read from a font table, and the longest name (hostile files).
+const MAX_TABLE_FONTS: usize = 2000;
+const MAX_FONT_NAME: usize = 256;
+
 /// Most parts (headers, notes, comments, text boxes) we create from one file.
 const MAX_PARTS: usize = 50_000;
+/// Deepest chain of headers/footers whose own sections reference further headers/footers.
+const MAX_HF_DEPTH: usize = 4;
 /// Most graphic work (items plus path segments, see `story::graphic_work`) built for one file's
 /// charts and diagrams; later ones are left empty.
 const MAX_GRAPHIC_WORK: usize = 2_000_000;
+/// Custom XML parts looked at for bibliography sources.
+const MAX_BIBLIOGRAPHY_PARTS: usize = 64;
+
 /// Longest attached-template path we keep (bytes); a longer one is not a real path.
 const MAX_TEMPLATE_PATH: usize = 32 * 1024;
 
@@ -47,6 +63,8 @@ pub(crate) struct Reader<'p> {
     pub moves: MoveCtx,
     media_by_path: HashMap<String, String>,
     hf_by_path: HashMap<String, u32>,
+    /// Header/footer parts being read right now (see [`MAX_HF_DEPTH`]).
+    hf_depth: usize,
     pub footnotes: HashMap<i64, u32>,
     pub endnotes: HashMap<i64, u32>,
     /// The note being read (kind, part id): its `w:footnoteRef` / `w:endnoteRef` mark is a
@@ -79,6 +97,10 @@ pub(crate) struct Reader<'p> {
     /// Linked text boxes as read: (`wps:txbx/@id` or `wps:linkedTxbx/@id`, `seq` (0 for the box
     /// holding the text), text box part). See [`link_text_boxes`].
     pub txbx_links: Vec<(u32, u32, u32)>,
+    /// The theme's fill styles, which shapes' style references point to.
+    pub theme_fills: shape_style::ThemeFills,
+    /// The fill of the group being read (what its members' `a:grpFill` stands for).
+    pub group_fill: Option<wordcraft_doc::fill::Fill>,
 }
 
 /// The package path that internal relationship `id` points at, if it has type `kind` (an `rt`
@@ -124,6 +146,7 @@ pub(crate) fn read_opened(pkg: &Package) -> Result<Document, DocxError> {
         moves: MoveCtx::default(),
         media_by_path: HashMap::new(),
         hf_by_path: HashMap::new(),
+        hf_depth: 0,
         footnotes: HashMap::new(),
         endnotes: HashMap::new(),
         current_note: None,
@@ -141,11 +164,18 @@ pub(crate) fn read_opened(pkg: &Package) -> Result<Document, DocxError> {
         content_types: None,
         embedded: EmbeddedManifest::default(),
         txbx_links: Vec::new(),
+        theme_fills: Default::default(),
+        group_fill: None,
     };
     r.pc.major_font = r.doc.settings.major_font.clone();
     r.pc.minor_font = r.doc.settings.minor_font.clone();
     let part = |t: &str| rels.by_type(t).filter(|x| !x.external).map(|x| x.target.clone());
 
+    // The font table and the fonts embedded through it ride along as opaque parts.
+    if let Some(p) = part(rt::FONT_TABLE) {
+        r.keep_part_tree(&p);
+        r.read_font_families(&p);
+    }
     if let Some(p) = part(rt::THEME) {
         r.read_theme(&p);
     }
@@ -155,7 +185,8 @@ pub(crate) fn read_opened(pkg: &Package) -> Result<Document, DocxError> {
             log::warn!("docx: ignoring unreadable {what}: {e}");
         }
     };
-    // Styles come before settings, but their theme colours already follow its colour mapping.
+    // Styles come before settings, but their theme colours already follow its colour mapping, and
+    // their `…Bidi` theme fonts its theme font language.
     if let Some(p) = part(rt::SETTINGS) {
         r.read_color_mapping(&p);
     }
@@ -178,26 +209,80 @@ pub(crate) fn read_opened(pkg: &Package) -> Result<Document, DocxError> {
     }
     if let Some(p) = part(rt::COMMENTS) {
         let ex = part(rt::COMMENTS_EX);
-        lenient("comments", r.read_comments(&p, ex.as_deref()));
+        let ids = part(rt::COMMENTS_IDS);
+        let cex = part(rt::COMMENTS_EXTENSIBLE);
+        lenient("comments", r.read_comments(&p, ex.as_deref(), ids.as_deref(), cex.as_deref()));
+    }
+    // Bibliography sources live in a custom XML data store (`b:Sources`), related from the
+    // package root or the main part; Word's own files sometimes leave the relationship out, so
+    // the conventional `customXml/itemN.xml` names are tried too. Each part is read at most once.
+    let mut bib_parts: Vec<String> = Vec::new();
+    for rel in root_rels.list.iter().chain(rels.list.iter()) {
+        if rel_is(&rel.kind, rt::CUSTOM_XML) && !rel.external && !bib_parts.contains(&rel.target) {
+            bib_parts.push(rel.target.clone());
+            if bib_parts.len() >= MAX_BIBLIOGRAPHY_PARTS {
+                break;
+            }
+        }
+    }
+    for i in 1..=16 {
+        let path = format!("customXml/item{i}.xml");
+        if bib_parts.len() < MAX_BIBLIOGRAPHY_PARTS && pkg.get(&path).is_some() && !bib_parts.contains(&path) {
+            bib_parts.push(path);
+        }
+    }
+    let mut seen_sources = Seen::default();
+    for path in &bib_parts {
+        if r.doc.sources.len() >= MAX_SOURCES {
+            break;
+        }
+        lenient("customXml bibliography", r.read_bibliography(path, &mut seen_sources));
     }
 
     if let Some(bg) = root.child("w:background").and_then(|b| b.attr("w:color")).and_then(Rgb::parse) {
         r.doc.settings.page_color = Some(bg);
+    }
+    // A picture or texture fill: `w:background/v:background/v:fill` with a relationship id.
+    if let Some(fill) = root.child("w:background").and_then(|b| b.child("v:background")).and_then(|b| b.child("v:fill")) {
+        let rid = fill.attr("r:id").or_else(|| fill.attr("r:embed")).or_else(|| fill.attr("o:relid"));
+        if let Some(media) = rid.and_then(|id| r.media_for(&rels, id)) {
+            r.doc.settings.page_picture = Some(PagePicture {
+                media,
+                fill_type: fill.attr("type").unwrap_or("").chars().take(32).collect(),
+                title: fill.attr("o:title").unwrap_or("").chars().take(255).collect(),
+            });
+        }
     }
     if let Some(body) = root.child("w:body") {
         let mut sc = StoryCtx::default();
         let mut blocks = Blocks::new();
         r.read_blocks(&mut sc, body, &rels, &mut blocks, 0);
         r.flush_pending(&mut sc, &mut blocks);
-        toc_field_to_heading(&mut blocks);
         r.doc.body = blocks;
+        unstyle_toc_links(&mut r.doc);
+        toc_control_to_toc(&mut r.doc.body);
+        toc_field_to_heading(&mut r.doc.body);
         if let Some(s) = body.child("w:sectPr") {
             r.doc.last_section = r.read_section(s, &rels);
+        }
+    }
+    // A watermark in the box Word's Design › Watermark gives it for the page keeps no box of its
+    // own: it follows the page, as when it was made.
+    let (pw, ph) = (r.doc.last_section.page_w, r.doc.last_section.page_h);
+    if let Some(wm) = r.doc.settings.watermark.as_mut()
+        && let Some([w, h]) = wm.size
+    {
+        let [dw, dh] = wordcraft_doc::Watermark { size: None, ..wm.clone() }.frame(pw, ph);
+        if (w - dw).abs() < 0.06 && (h - dh).abs() < 0.06 {
+            wm.size = None;
         }
     }
 
     let core = root_rels.by_type(rt::CORE).map(|x| x.target.clone()).unwrap_or_else(|| "docProps/core.xml".into());
     r.read_core(&core);
+    if let Some(app) = root_rels.by_type(rt::APP).map(|x| x.target.clone()) {
+        r.read_app(&app);
+    }
     if let Some(c) = root_rels.by_type(rt::CUSTOM)
         && let Ok(Some(x)) = r.xml(&c.target)
     {
@@ -207,11 +292,14 @@ pub(crate) fn read_opened(pkg: &Package) -> Result<Document, DocxError> {
     // bytes, never parsed or run, so a .docm/.dotm saved again carries exactly what the file had.
     // Only the relationships and content types are read.
     if let Some(v) = part(rt::VBA_PROJECT)
-        && let Some(b) = pkg.get(&v).filter(|b| !b.is_empty())
+        && let Some(b) = pkg.get_shared(&v).filter(|b| !b.is_empty())
     {
-        r.doc.passthrough.insert(VBA_PROJECT_PART.into(), Arc::new(b.to_vec()));
+        r.doc.passthrough.insert(VBA_PROJECT_PART.into(), b.clone());
         r.read_vba_related(&v);
     }
+    r.read_glossary(&rels);
+    r.keep_custom_xml(&root_rels, &rels);
+    r.keep_unmodelled(&root_rels, &rels);
     if !r.embedded.parts.is_empty() {
         let manifest = r.embedded.to_bytes();
         r.doc.passthrough.insert(EMBEDDED_PARTS.into(), Arc::new(manifest));
@@ -344,33 +432,169 @@ fn keep_glued_ids(doc: &mut Document, glued: &HashSet<u32>) {
     });
 }
 
-/// Word starts a TOC field in the first entry; the engine keeps it at the end of the TOC heading
-/// (the paragraph holding the field marks where the TOC is). Move it there when one precedes it.
-fn toc_field_to_heading(body: &mut Blocks) {
-    for i in 1..body.len() {
-        let heading = body[i - 1].as_para().filter(|p| p.props.style.as_deref() == Some("TOCHeading"));
-        let has_toc = |o: &InlineObject| matches!(o, InlineObject::Field { instr, .. } if is_toc(instr));
-        if heading.is_none_or(|h| h.objects.iter().any(has_toc)) {
-            continue;
-        }
-        let Some((field, props)) = body[i].as_para().and_then(|p| match p.object_at(0) {
-            Some(f @ InlineObject::Field { result, .. }) if result.is_empty() && has_toc(f) => Some((f.clone(), p.props_of_char(0).clone())),
-            _ => None,
-        }) else {
-            continue;
-        };
-        if let Some(Block::Para(p)) = body.get_mut(i).map(Arc::make_mut) {
-            let _ = p.delete(0, OBJ.len_utf8());
-        }
-        if let Some(Block::Para(h)) = body.get_mut(i - 1).map(Arc::make_mut) {
-            let end = h.len();
-            let _ = h.insert_object(end, field, &props);
+/// Word draws a table of contents' entry links without the Hyperlink character style (no blue,
+/// no underline) though the entries carry it (measured in Word for Windows: a Hyperlink-styled run
+/// in a hyperlink inside a TOC field's result is plain; one outside a hyperlink, another style,
+/// direct formatting, or a hyperlink in another field keep their look). The style is dropped from
+/// those runs so they look the same here; the links stay. The style is found by its built-in
+/// name: localized Word and older files give it another id (`Hipervnculo`, `Hyperlnk`).
+fn unstyle_toc_links(doc: &mut Document) {
+    let ids: HashSet<String> = doc
+        .styles
+        .styles
+        .iter()
+        .filter(|s| s.kind == StyleKind::Character && s.name.eq_ignore_ascii_case("Hyperlink"))
+        .map(|s| s.id.clone())
+        .chain(["Hyperlink".to_string()])
+        .collect();
+    for f in doc.field_ranges(wordcraft_doc::StoryRef::Body) {
+        if is_toc(&f.instr) {
+            let _ = doc.format_range(&f.start, &f.end, &|c| {
+                if c.link.is_some() && c.style.as_deref().is_some_and(|s| ids.contains(s)) {
+                    c.style = None;
+                }
+            });
         }
     }
 }
 
+/// Word's Table of Contents content control belongs to the TOC: the writer puts it back around
+/// the TOC heading and its entries (`toc_span`), which References › Update Table rebuilds. It is
+/// handed to the TOC only when the writer would put it back around the same paragraphs; any other
+/// is kept as read, or saving would drop it (#2427).
+fn toc_control_to_toc(body: &mut Blocks) {
+    let span = {
+        let events = control_events(body);
+        let (pairs, _) = pair_events(&events);
+        pairs.iter().find_map(|&(o, c, depth)| {
+            let (ControlEvent::Open { block: s, off: Some(0), control }, ControlEvent::Close { block: e, off: Some(off) }) =
+                (events.get(o)?, events.get(c)?)
+            else {
+                return None;
+            };
+            let toc = matches!(&control.kind, ControlKind::Gallery { list: false, gallery, .. } if gallery == "Table of Contents");
+            let at_end = body.get(*e)?.as_para()?.len() == off.checked_add(OBJ.len_utf8())?;
+            (depth == 0 && toc && at_end).then_some((*s, *e, *off))
+        })
+    };
+    let Some((s, e, off)) = span else { return };
+    let mut toc = body.clone();
+    // The end first: both markers may be in the same paragraph.
+    if let Some(Block::Para(p)) = toc.get_mut(e).map(Arc::make_mut) {
+        let _ = p.delete(off, p.len());
+    }
+    if let Some(Block::Para(p)) = toc.get_mut(s).map(Arc::make_mut) {
+        let _ = p.delete(0, OBJ.len_utf8());
+    }
+    toc_field_to_heading(&mut toc);
+    if crate::write::written_toc_span(&toc) == Some((s, e)) {
+        *body = toc;
+        return;
+    }
+    // TOCs the writer rebuilds in the same paragraphs once Update Table has turned them into the
+    // engine's TOC (`range_toc_to_field`) are handed over as the range read, as without the control:
+    // - Word's layout, the field's end alone in a paragraph after the entries (it goes with them);
+    // - ours with a heading that isn't a `TOCHeading`, written empty and the field opening in the
+    //   first entry. Kept in the control, that paragraph wouldn't be empty and each save and update
+    //   would add a blank line above the entries (#2182).
+    let mut engine = toc.clone();
+    let mut last = e;
+    // The entry before Word's paragraph holding nothing but the field's end, and that end's format.
+    let end_only = e.checked_sub(1).filter(|&l| l > s).and_then(|l| {
+        let p = engine.get(e)?.as_para()?;
+        let only = p.section.is_none() && p.len() == OBJ.len_utf8() && matches!(p.object_at(0), Some(InlineObject::FieldEnd));
+        only.then(|| (l, p.props_of_char(0).clone()))
+    });
+    if let Some((l, props)) = end_only {
+        engine.remove(e);
+        last = l;
+        if let Some(Block::Para(p)) = engine.get_mut(l).map(Arc::make_mut) {
+            let len = p.len();
+            let _ = p.insert_object(len, InlineObject::FieldEnd, &props);
+        }
+    }
+    if engine.get(s).and_then(|b| b.as_para()).is_some_and(|p| p.is_empty() && p.section.is_none()) {
+        field_to_heading(&mut engine, s + 1);
+    } else {
+        toc_field_to_heading(&mut engine);
+    }
+    if crate::write::written_toc_span(&engine) == Some((s, last)) {
+        *body = toc;
+    }
+}
+
+/// Normalize only a complete TOC range that the engine's heading/entry representation can
+/// reproduce exactly. Other imported TOCs keep their explicit boundaries, independent of styles.
+fn toc_field_to_heading(body: &mut Blocks) {
+    for i in 1..body.len() {
+        if body[i - 1].as_para().is_some_and(|p| p.props.style.as_deref() == Some("TOCHeading")) {
+            field_to_heading(body, i);
+        }
+    }
+}
+
+/// Moves the TOC field that opens paragraph `i` (a complete range over the entries, or an empty
+/// field) to the end of paragraph `i - 1`, the engine's TOC heading, unless that one has a TOC
+/// field already.
+fn field_to_heading(body: &mut Blocks, i: usize) {
+    let has_toc = |o: &InlineObject| matches!(o, InlineObject::Field { instr, .. } if is_toc(instr));
+    if i == 0 || body.get(i - 1).and_then(|b| b.as_para()).is_none_or(|h| h.objects.iter().any(has_toc)) {
+        return;
+    }
+    let Some((field, props, end)) = body.get(i).and_then(|b| b.as_para()).and_then(|p| {
+        let (field, end) = match p.object_at(0) {
+            Some(InlineObject::FieldStart { instr, locked, dirty }) if is_toc(instr) => (
+                InlineObject::Field { instr: instr.clone(), result: String::new(), locked: *locked, dirty: *dirty, code: false, form: String::new() },
+                Some(toc_range_end(body, i)?),
+            ),
+            Some(f @ InlineObject::Field { result, .. }) if result.is_empty() && has_toc(f) => (f.clone(), None),
+            _ => return None,
+        };
+        Some((field, p.props_of_char(0).clone(), end))
+    }) else {
+        return;
+    };
+    // Delete the end first: the two markers may occupy the same paragraph.
+    if let Some(Block::Para(p)) = end.and_then(|end| body.get_mut(end)).map(Arc::make_mut) {
+        let off = p.len().saturating_sub(OBJ.len_utf8());
+        let _ = p.delete(off, p.len());
+    }
+    if let Some(Block::Para(p)) = body.get_mut(i).map(Arc::make_mut) {
+        let _ = p.delete(0, OBJ.len_utf8());
+    }
+    if let Some(Block::Para(h)) = body.get_mut(i - 1).map(Arc::make_mut) {
+        let end = h.len();
+        let _ = h.insert_object(end, field, &props);
+    }
+}
+
 fn is_toc(instr: &str) -> bool {
-    instr.trim_start().get(..3).is_some_and(|k| k.eq_ignore_ascii_case("TOC"))
+    instr.split_whitespace().next().is_some_and(|k| k.eq_ignore_ascii_case("TOC"))
+}
+
+/// The actual matching end must also be the end the styled writer would choose: at the end
+/// of the last contiguous TOC entry, with no section break or trailing content outside it.
+fn toc_range_end(body: &Blocks, start: usize) -> Option<usize> {
+    let entry =
+        |p: &wordcraft_doc::Paragraph| p.section.is_none() && p.props.style.as_deref().is_some_and(|s| s.starts_with("TOC") && s != "TOCHeading");
+    let mut depth = 0_usize;
+    for (i, b) in body.iter().enumerate().skip(start) {
+        let p = b.as_para().filter(|p| entry(p))?;
+        for (off, o) in p.object_offsets().into_iter().zip(&p.objects) {
+            match o {
+                InlineObject::FieldStart { .. } => depth = depth.checked_add(1)?,
+                InlineObject::FieldEnd => {
+                    depth = depth.checked_sub(1)?;
+                    if depth == 0 {
+                        let following_entry = body.get(i + 1).and_then(|b| b.as_para()).is_some_and(entry);
+                        return (off.checked_add(OBJ.len_utf8()) == Some(p.len()) && !following_entry).then_some(i);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    None
 }
 
 /// Built-in style names Word stores in lower case, and how the UI shows them.
@@ -440,7 +664,7 @@ impl Reader<'_> {
                 log::warn!("docx: not carrying VBA-related part {path:?}");
                 continue;
             }
-            let Some(bytes) = self.pkg.get(path) else {
+            let Some(bytes) = self.pkg.get_shared(path) else {
                 log::warn!("docx: VBA-related part {path} is missing; keeping the project without it");
                 continue;
             };
@@ -450,11 +674,24 @@ impl Reader<'_> {
             }
             kept += 1;
             manifest.push_str(&format!("{}\t{path}\t{ct}\n", rel.kind));
-            self.doc.passthrough.entry(path.to_string()).or_insert_with(|| Arc::new(bytes.to_vec()));
+            self.doc.passthrough.entry(path.to_string()).or_insert_with(|| bytes.clone());
         }
         if !manifest.is_empty() {
             self.doc.passthrough.insert(VBA_RELATED.into(), Arc::new(manifest.into_bytes()));
         }
+    }
+
+    /// The fonts the font table classes as roman (`w:font/w:family w:val="roman"`).
+    fn read_font_families(&mut self, path: &str) {
+        let Ok(Some(table)) = self.xml(path) else { return };
+        self.doc.settings.roman_fonts = table
+            .children("w:font")
+            .filter(|f| f.child("w:family").and_then(|v| v.attr("w:val")) == Some("roman"))
+            .filter_map(|f| f.attr("w:name"))
+            .filter(|n| !n.is_empty() && n.len() <= MAX_FONT_NAME)
+            .take(MAX_TABLE_FONTS)
+            .map(str::to_string)
+            .collect();
     }
 
     fn xml(&self, path: &str) -> Result<Option<El>, DocxError> {
@@ -492,7 +729,7 @@ impl Reader<'_> {
         if let Some(k) = self.media_by_path.get(&rel.target) {
             return Some(k.clone());
         }
-        let bytes = self.pkg.get(&rel.target)?;
+        let bytes = self.pkg.get_shared(&rel.target)?;
         let base: String =
             rel.target.rsplit('/').next().unwrap_or("image").chars().filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-')).collect();
         let base = if base.is_empty() || base.starts_with('.') { format!("image{base}") } else { base };
@@ -505,7 +742,7 @@ impl Reader<'_> {
                 None => format!("{base}_{n}"),
             };
         }
-        self.doc.media.insert(key.clone(), Arc::new(bytes.to_vec()));
+        self.doc.media.insert(key.clone(), bytes.clone());
         self.media_by_path.insert(rel.target.clone(), key.clone());
         Some(key)
     }
@@ -524,7 +761,7 @@ impl Reader<'_> {
         if let Some(id) = self.hf_by_path.get(path) {
             return Some(*id);
         }
-        if self.doc.parts.len() >= MAX_PARTS {
+        if self.doc.parts.len() >= MAX_PARTS || self.hf_depth >= MAX_HF_DEPTH {
             return None;
         }
         // Reserve the id first so a (malformed) self-reference can't recurse.
@@ -537,8 +774,11 @@ impl Reader<'_> {
         };
         let rels = self.pkg.rels(path);
         let mut sc = StoryCtx::default();
+        sc.in_hf = true;
         let mut blocks = Blocks::new();
+        self.hf_depth += 1;
         self.read_blocks(&mut sc, &root, &rels, &mut blocks, 0);
+        self.hf_depth = self.hf_depth.saturating_sub(1);
         self.flush_pending(&mut sc, &mut blocks);
         if let Some(p) = self.doc.parts.get_mut(&id)
             && !blocks.is_empty()
@@ -572,6 +812,7 @@ impl Reader<'_> {
             self.pc.theme_colors = colors.clone();
             self.doc.settings.theme_colors = colors;
         }
+        self.theme_fills = shape_style::ThemeFills::read(el.child("a:fmtScheme"));
         if let Some(fs) = el.child("a:fontScheme") {
             let face =
                 |n: &str| fs.child(n).and_then(|f| f.child("a:latin")).and_then(|l| l.attr("typeface")).filter(|t| !t.is_empty()).map(str::to_string);
@@ -581,15 +822,33 @@ impl Reader<'_> {
             if let Some(f) = face("a:minorFont") {
                 self.doc.settings.minor_font = f;
             }
+            let cs = |n: &str| fs.child(n).and_then(|f| f.child("a:cs")).and_then(|c| c.attr("typeface")).unwrap_or_default().to_string();
+            self.pc.major_cs = cs("a:majorFont");
+            self.pc.minor_cs = cs("a:minorFont");
+            // Per-script fonts (`a:font script="Arab"`); Office's themes list about 30.
+            let scripts = |n: &str| -> Vec<(String, String)> {
+                let Some(f) = fs.child(n) else { return Vec::new() };
+                f.els()
+                    .filter(|e| e.name == "a:font")
+                    .filter_map(|e| Some((e.attr("script")?, e.attr("typeface")?)))
+                    .filter(|(s, t)| s.len() <= 8 && !t.is_empty() && t.len() < 256)
+                    .take(256)
+                    .map(|(s, t)| (s.to_string(), t.to_string()))
+                    .collect()
+            };
+            self.pc.major_scripts = scripts("a:majorFont");
+            self.pc.minor_scripts = scripts("a:minorFont");
         }
         self.pc.major_font = self.doc.settings.major_font.clone();
         self.pc.minor_font = self.doc.settings.minor_font.clone();
         self.pc.theme = self.doc.settings.theme_colors.clone();
     }
 
-    /// `w:settings/w:clrSchemeMapping`: which scheme colour text1, background1… stand for.
+    /// `w:settings/w:clrSchemeMapping`: which scheme colour text1, background1… stand for. Also
+    /// `w:themeFontLang/@w:bidi`, the language whose script picks the `…Bidi` theme fonts.
     fn read_color_mapping(&mut self, path: &str) {
         let Ok(Some(root)) = self.xml(path) else { return };
+        self.pc.bidi_script = root.child("w:themeFontLang").and_then(|l| l.attr("w:bidi")).filter(|v| !v.trim().is_empty()).map(props::lang_script);
         let Some(m) = root.child("w:clrSchemeMapping") else { return };
         let names = [
             "dark1",
@@ -629,6 +888,8 @@ impl Reader<'_> {
     }
 
     fn read_styles(&mut self, path: &str) -> Result<(), DocxError> {
+        /// Largest `w:latentStyles` kept (Word's has ~380 exceptions, ~40 KB).
+        const MAX_LATENT_STYLES_XML: usize = 1 << 20;
         let Some(root) = self.xml(path)? else { return Ok(()) };
         // The default paragraph style must be called `Normal` in our model.
         let has_normal = root.children("w:style").any(|s| s.attr("w:styleId") == Some("Normal"));
@@ -641,23 +902,27 @@ impl Reader<'_> {
             self.pc.alias.insert(id.to_string(), "Normal".into());
         }
         let mut sheet = StyleSheet::empty();
+        sheet.default_para_present = root.child("w:docDefaults").and_then(|dd| dd.child("w:pPrDefault")).is_some();
         if let Some(dd) = root.child("w:docDefaults") {
             if let Some(r) = dd.child("w:rPrDefault").and_then(|d| d.child("w:rPr")) {
                 sheet.default_chr = self.pc.rpr(r);
             }
             if let Some(p) = dd.child("w:pPrDefault").and_then(|d| d.child("w:pPr")) {
                 sheet.default_para = self.pc.ppr(p).0;
+                // Word makes no paragraph a text frame from the document defaults: the sizeless
+                // top-left `w:framePr` Apple Pages writes there would put every paragraph, the
+                // headers' and footers' included, at the page's corner (#2360).
+                sheet.default_para.frame = None;
             }
         }
         if sheet.default_chr.size.is_none() {
             sheet.default_chr.size = Some(10.0);
         }
+        // Built-in styles' behaviour (gallery, priority, visibility), written back as is.
+        sheet.latent_styles = root.child("w:latentStyles").map(|l| l.to_xml()).filter(|x| x.len() <= MAX_LATENT_STYLES_XML);
         for s in root.children("w:style").take(10_000) {
             let Some(raw_id) = s.attr("w:styleId").filter(|i| !i.is_empty()) else { continue };
             let id = self.pc.style_id(raw_id);
-            if sheet.get(&id).is_some() {
-                continue;
-            }
             let kind = match s.attr("w:type").unwrap_or("paragraph") {
                 "character" => StyleKind::Character,
                 "table" => StyleKind::Table,
@@ -678,6 +943,15 @@ impl Reader<'_> {
                 hidden: flag(s, "w:semiHidden").unwrap_or(false) || flag(s, "w:hidden").unwrap_or(false),
                 builtin: !s.attr("w:customStyle").is_some_and(|v| v == "1" || v == "true"),
                 locked: flag(s, "w:locked").unwrap_or(false),
+                // Only where the writer couldn't tell from the id (it flags the English ids).
+                default: s.attr("w:default").is_some_and(|v| v == "1" || v == "true")
+                    && !matches!(
+                        (kind, id.as_str()),
+                        (StyleKind::Paragraph, "Normal")
+                            | (StyleKind::Character, "DefaultParagraphFont")
+                            | (StyleKind::Table, "TableNormal")
+                            | (StyleKind::Numbering, "NoList")
+                    ),
                 ..Default::default()
             };
             if let Some(p) = s.child("w:pPr") {
@@ -690,7 +964,36 @@ impl Reader<'_> {
                 let parts = self.table_style_parts(s, &mut st);
                 st.table = (parts != TableStyleParts::default()).then_some(parts);
             }
-            sheet.styles.push(st);
+            // A style defined twice (some generators write their own Heading 1 after a
+            // placeholder one) is the last definition, whole: Word drops the earlier one rather
+            // than merging the two (observed with synthetic documents).
+            match sheet.styles.iter_mut().find(|s| s.id == id) {
+                Some(earlier) => *earlier = st,
+                None => sheet.styles.push(st),
+            }
+        }
+        // Styles that give only a list level take the list from the style they are based on
+        // (Heading 3: level 3 of Heading 2's outline list).
+        let fixed: Vec<Option<wordcraft_doc::props::NumRef>> = sheet
+            .styles
+            .iter()
+            .map(|s| match s.para.numbering {
+                Some(n) if n.num == props::LEVEL_ONLY => {
+                    let base = s.based_on.as_deref().and_then(|b| props::chain_list(&sheet, b));
+                    base.map(|num| wordcraft_doc::props::NumRef { num, level: n.level })
+                }
+                other => other,
+            })
+            .collect();
+        for (s, n) in sheet.styles.iter_mut().zip(fixed) {
+            s.para.numbering = n;
+        }
+        if sheet.default_para.numbering.is_some_and(|n| n.num == props::LEVEL_ONLY) {
+            sheet.default_para.numbering = None;
+        }
+        // A producer that never writes `w:qFormat` (LibreOffice) still gets Word's usual gallery.
+        if !sheet.styles.iter().any(|s| s.quick) {
+            sheet.add_default_gallery();
         }
         self.doc.styles = sheet;
         Ok(())
@@ -706,59 +1009,42 @@ impl Reader<'_> {
             }
             t.fill = tp.child("w:shd").and_then(|e| self.pc.shd_fill(e));
             t.cell_margins = tp.child("w:tblCellMar").map(props::margins);
-            t.band_size = tp.child_val("w:tblStyleRowBandSize").and_then(u32_of).filter(|n| *n > 0).map(|n| n.min(1000));
+            t.band_size = tp.child_val("w:tblStyleRowBandSize").and_then(u32_of).map(|n| n.min(1000));
+            t.col_band_size = tp.child_val("w:tblStyleColBandSize").and_then(u32_of).map(|n| n.min(1000));
         }
         for c in s.children("w:tblStylePr").take(64) {
-            let fill = c.child("w:tcPr").and_then(|p| p.child("w:shd")).and_then(|e| self.pc.shd_fill(e));
-            let cell_borders = c.child("w:tcPr").and_then(|p| p.child("w:tcBorders")).map(props::borders);
-            let chr = c.child("w:rPr").map(|r| self.pc.rpr(r)).unwrap_or_default();
-            match c.attr("w:type") {
-                Some("wholeTable") => {
-                    if let Some(p) = c.child("w:pPr") {
-                        st.para.overlay(&self.pc.ppr(p).0);
-                    }
-                    st.chr.overlay(&chr);
-                    if fill.is_some() {
-                        t.fill = fill;
-                    }
-                    if let Some(b) = c.child("w:tblPr").and_then(|p| p.child("w:tblBorders")) {
-                        t.borders = Some(props::borders(b));
-                    }
+            let Some(part) = c.attr("w:type").and_then(TablePart::from_ooxml) else { continue };
+            let tc = c.child("w:tcPr");
+            let ppr = c.child("w:pPr").map(|p| self.pc.ppr(p).0);
+            let f = PartFormat {
+                chr: c.child("w:rPr").map(|r| self.pc.rpr(r)).unwrap_or_default(),
+                fill: tc.and_then(|p| p.child("w:shd")).and_then(|e| self.pc.shd_fill(e)),
+                borders: tc.and_then(|p| p.child("w:tcBorders")).map(props::borders),
+                align: ppr.as_ref().and_then(|p| p.align),
+                v_align: tc.and_then(|p| p.child_val("w:vAlign")).map(|v| match v {
+                    "center" => VAlign::Center,
+                    "bottom" => VAlign::Bottom,
+                    _ => VAlign::Top,
+                }),
+            };
+            if part == TablePart::WholeTable {
+                // The whole table's paragraph and run properties are the style's own; its
+                // borders the table borders.
+                if let Some(p) = ppr {
+                    st.para.overlay(&p);
                 }
-                Some("firstRow") => {
-                    t.header_fill = fill;
-                    t.header_chr = chr;
-                    t.header_borders = cell_borders;
+                st.chr.overlay(&f.chr);
+                if f.fill.is_some() {
+                    t.fill = f.fill;
                 }
-                Some("band1Horz") => {
-                    t.band_fill = fill;
-                    t.band_chr = chr;
-                    t.band_borders = cell_borders;
+                if let Some(b) = c.child("w:tblPr").and_then(|p| p.child("w:tblBorders")) {
+                    t.borders = Some(props::borders(b));
                 }
-                Some("firstCol") => {
-                    t.first_col_chr = chr;
-                    t.first_col_fill = fill;
-                    t.first_col_borders = cell_borders;
+                if f.v_align.is_some() {
+                    t.regions.insert(part, PartFormat { v_align: f.v_align, ..PartFormat::default() });
                 }
-                Some("lastCol") => {
-                    t.last_col_chr = chr;
-                    t.last_col_fill = fill;
-                    t.last_col_borders = cell_borders;
-                }
-                Some("lastRow") => {
-                    t.total_chr = chr;
-                    t.total_fill = fill;
-                    // The top rule is kept on its own (as built-in styles have it); the other edges
-                    // are the region's borders.
-                    t.total_border_top = cell_borders.and_then(|b| b.top);
-                    t.total_borders = cell_borders.map(|b| wordcraft_doc::props::Borders { top: None, ..b }).filter(|b| *b != Default::default());
-                }
-                Some("band1Vert") => {
-                    t.col_band_fill = fill;
-                    t.col_band_chr = chr;
-                    t.col_band_borders = cell_borders;
-                }
-                _ => {}
+            } else {
+                t.set_part(part, f);
             }
         }
         t
@@ -780,7 +1066,19 @@ impl Reader<'_> {
             if let Some(link) = a.child_val("w:numStyleLink") {
                 links.push((id, link.to_string()));
             }
-            abstracts.push(AbstractNum { id, name: a.child_val("w:name").map(str::to_string), levels });
+            let hex = |v: &str| v.len() == 8 && v.bytes().all(|b| b.is_ascii_hexdigit());
+            abstracts.push(AbstractNum {
+                id,
+                name: a.child_val("w:name").map(str::to_string),
+                levels,
+                nsid: a.child_val("w:nsid").filter(|v| hex(v)).map(str::to_ascii_uppercase),
+                tmpl: a.child_val("w:tmpl").filter(|v| hex(v)).map(str::to_ascii_uppercase),
+                multi_level_type: a
+                    .child_val("w:multiLevelType")
+                    // `multilevel` is what the writer derives for the nine levels read here.
+                    .filter(|v| matches!(*v, "singleLevel" | "hybridMultilevel"))
+                    .map(str::to_string),
+            });
         }
         let mut nums = Vec::new();
         for n in root.children("w:num").take(10_000) {
@@ -862,6 +1160,9 @@ impl Reader<'_> {
 
     fn read_settings(&mut self, path: &str) -> Result<(), DocxError> {
         let Some(root) = self.xml(path)? else { return Ok(()) };
+        if let Some(b) = self.pkg.get(path).filter(|b| crate::write::settings_has_unowned(b)) {
+            self.doc.passthrough.insert(crate::package::SETTINGS_ORIG.into(), Arc::new(b.to_vec()));
+        }
         let rels = self.pkg.rels(path);
         let s = &mut self.doc.settings;
         for k in root.els() {
@@ -875,7 +1176,10 @@ impl Reader<'_> {
                         .filter(|t| !t.is_empty() && t.len() <= MAX_TEMPLATE_PATH);
                 }
                 "w:linkStyles" => s.link_styles = on_off(k),
+                "w:removePersonalInformation" => s.remove_personal_info = on_off(k),
+                "w:removeDateAndTime" => s.remove_date_time = on_off(k),
                 "w:compat" => {
+                    s.allow_space_of_same_style_in_table = k.child("w:allowSpaceOfSameStyleInTable").is_some_and(on_off);
                     // Only Word's own setting: another `w:uri` names a different application's.
                     let mode = k
                         .children("w:compatSetting")
@@ -887,8 +1191,10 @@ impl Reader<'_> {
                     if let Some(m) = mode.and_then(u32_of) {
                         s.compat_mode = m.clamp(11, 99);
                     }
+                    s.sum_paragraph_spacing = k.children("w:doNotUseHTMLParagraphAutoSpacing").any(on_off);
                 }
                 "w:trackRevisions" => s.track_changes = on_off(k),
+                "w:doNotTrackMoves" => s.track_moves = !on_off(k),
                 "w:defaultTabStop" => {
                     if let Some(v) = tw(k, "w:val").filter(|v| *v > 0.0) {
                         s.default_tab = v.clamp(1.0, 1584.0);
@@ -928,6 +1234,16 @@ impl Reader<'_> {
                     s.endnote_pr = props::note_pr(k, false);
                 }
                 "w:documentProtection" => read_protection(k, s),
+                "w:zoom" => {
+                    let percent = k.attr("w:percent").and_then(|v| u32_of(v.trim_end_matches('%'))).unwrap_or(100).clamp(10, 500);
+                    let fit = match k.attr("w:val") {
+                        Some("fullPage") => Some(ZoomFit::OnePage),
+                        Some("bestFit") => Some(ZoomFit::PageWidth),
+                        Some("textFit") => Some(ZoomFit::TextWidth),
+                        _ => None,
+                    };
+                    s.zoom = Some(Zoom { percent, fit }).filter(|z| z.percent != 100 || z.fit.is_some());
+                }
                 _ => {}
             }
         }
@@ -1004,7 +1320,23 @@ impl Reader<'_> {
         *slot = Some(blocks);
     }
 
-    fn read_comments(&mut self, path: &str, ext: Option<&str>) -> Result<(), DocxError> {
+    /// The extended properties a save carries over ([`crate::package::APP_KEPT_PROPS`]).
+    fn read_app(&mut self, path: &str) {
+        let Ok(Some(root)) = self.xml(path) else { return };
+        let mut kept = String::new();
+        for e in root.els() {
+            let name = e.local();
+            let value = e.text();
+            if crate::package::APP_KEPT_PROPS.contains(&name) && value.len() <= 2048 && !value.contains(['\t', '\n']) {
+                kept.push_str(&format!("{name}\t{value}\n"));
+            }
+        }
+        if !kept.is_empty() {
+            self.doc.passthrough.insert(crate::package::APP_KEPT.into(), Arc::new(kept.into_bytes()));
+        }
+    }
+
+    fn read_comments(&mut self, path: &str, ext: Option<&str>, ids: Option<&str>, cex: Option<&str>) -> Result<(), DocxError> {
         let Some(root) = self.xml(path)? else { return Ok(()) };
         let rels = self.pkg.rels(path);
         let mut by_para: HashMap<String, u32> = HashMap::new();
@@ -1044,6 +1376,7 @@ impl Reader<'_> {
                     parent: None,
                     resolved: false,
                     part,
+                    ..Default::default()
                 },
             );
             self.comment_map.insert(file_id, id);
@@ -1061,7 +1394,53 @@ impl Reader<'_> {
                 }
             }
         }
+        // Durable ids (by paragraph id) and UTC dates (by durable id), which the writer
+        // carries over (`write_comment_ids`). Their namespaces (w16cid, w16cex) have no canonical
+        // prefix here, so attributes are found by local name.
+        let local = |e: &crate::xml::El, name: &str| -> Option<String> {
+            e.attrs.iter().find(|(k, _)| k.rsplit(':').next() == Some(name)).map(|(_, v)| v.clone())
+        };
+        let mut by_durable: HashMap<String, u32> = HashMap::new();
+        if let Some(ids) = ids
+            && let Ok(Some(x)) = self.xml(ids)
+        {
+            for e in x.els().filter(|e| e.local() == "commentId") {
+                let Some(cid) = local(e, "paraId").and_then(|p| by_para.get(&p).copied()) else { continue };
+                let Some(durable) = local(e, "durableId").filter(|d| crate::write::durable_id_ok(d)) else { continue };
+                if let Some(c) = entries.get_mut(&cid) {
+                    c.durable_id = Some(durable.to_ascii_uppercase());
+                    by_durable.insert(durable.to_ascii_uppercase(), cid);
+                }
+            }
+        }
+        if let Some(cex) = cex
+            && let Ok(Some(x)) = self.xml(cex)
+        {
+            for e in x.els().filter(|e| e.local() == "commentExtensible") {
+                let Some(cid) = local(e, "durableId").and_then(|d| by_durable.get(&d.to_ascii_uppercase()).copied()) else { continue };
+                let date = local(e, "dateUtc").filter(|d| d.len() <= 40 && d.chars().all(|c| c.is_ascii_alphanumeric() || ":-.+".contains(c)));
+                if let (Some(c), Some(date)) = (entries.get_mut(&cid), date) {
+                    c.date_utc = Some(date);
+                }
+            }
+        }
         self.doc.comments = entries;
+        Ok(())
+    }
+
+    /// Sources from a `b:Sources` custom XML part (other custom XML is left alone); at most
+    /// [`MAX_SOURCES`] in all, and the document's citation style from `StyleName`.
+    fn read_bibliography(&mut self, path: &str, seen: &mut Seen) -> Result<(), DocxError> {
+        let Some(root) = self.xml(path)? else { return Ok(()) };
+        if root.local() != "Sources" {
+            return Ok(());
+        }
+        let room = MAX_SOURCES.saturating_sub(self.doc.sources.len());
+        let bib = crate::bibliography::parse(&root, seen, room);
+        if self.doc.settings.bib_style.is_none() {
+            self.doc.settings.bib_style = bib.style;
+        }
+        self.doc.sources.extend(bib.sources);
         Ok(())
     }
 

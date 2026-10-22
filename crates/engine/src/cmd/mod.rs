@@ -16,6 +16,7 @@ pub mod fields;
 pub mod file;
 pub mod find_pattern;
 pub mod fmt_revisions;
+pub mod font;
 pub mod format;
 pub mod index;
 pub mod ink_shape;
@@ -34,14 +35,19 @@ pub mod phonetic;
 pub mod protect;
 pub mod references;
 pub mod review;
+pub mod shape_fill;
 pub mod smart_art;
 pub mod speech;
 pub mod table;
 pub mod table_draw;
+pub mod table_formula;
+pub mod table_mouse;
+pub mod table_resize;
 pub mod table_style;
 pub mod templates;
 pub mod text;
 pub mod tools;
+pub mod user_templates;
 pub mod view;
 pub mod wordart;
 
@@ -60,6 +66,7 @@ pub fn registry() -> Registry {
     v.extend(edit::specs());
     v.extend(paste::specs());
     v.extend(format::specs());
+    v.extend(font::specs());
     v.extend(phonetic::specs());
     v.extend(para::specs());
     v.extend(lists::specs());
@@ -72,6 +79,8 @@ pub fn registry() -> Registry {
     v.extend(table::specs());
     v.extend(table_style::specs());
     v.extend(table_draw::specs());
+    v.extend(table_resize::specs());
+    v.extend(table_mouse::specs());
     v.extend(review::specs());
     v.extend(file::specs());
     v.extend(options::specs());
@@ -82,6 +91,7 @@ pub fn registry() -> Registry {
     v.extend(citations::specs());
     v.extend(index::specs());
     v.extend(objects::specs());
+    v.extend(shape_fill::specs());
     v.extend(smart_art::specs());
     v.extend(chart::specs());
     v.extend(draw::specs());
@@ -90,6 +100,7 @@ pub fn registry() -> Registry {
     v.extend(connectors::specs());
     v.extend(tools::specs());
     v.extend(templates::specs());
+    v.extend(user_templates::specs());
     v.extend(protect::specs());
     v.extend(speech::specs());
     v.extend(controls::specs());
@@ -124,6 +135,19 @@ pub fn pos_json(p: &Pos) -> Value {
 /// The standard result: the selection after the command.
 pub fn sel_result(s: &Session) -> CmdResult {
     Ok(json!({"anchor": pos_json(&s.sel.anchor), "focus": pos_json(&s.sel.focus)}))
+}
+
+/// The paragraphs the selection covers: those between its ends (not the next one when it ends at
+/// that one's start, #418) or, for whole table cells that aren't one run of the text (part of a
+/// column), just the cells' own.
+pub fn selected_paths(s: &Session) -> Vec<wordcraft_doc::Path> {
+    if s.cell_range().is_some()
+        && let Some(segs) = s.column_segments()
+    {
+        return segs.iter().map(|(a, _)| a.path.clone()).collect();
+    }
+    let (a, b) = s.sel.ordered();
+    s.doc.para_paths_in(&a, &b)
 }
 
 /// Delete the selection (respecting track changes); returns the collapsed position.
@@ -178,6 +202,18 @@ pub fn join_next_para(s: &mut Session, story: StoryRef, path: &wordcraft_doc::Pa
     let p = s.doc.para_mut(story, path)?;
     (p.mark.ins, p.mark.del) = revs;
     p.touch();
+    Ok(true)
+}
+
+/// Remove the paragraph at `path` when it is empty, carries no section break and another
+/// paragraph follows in the same container: the next paragraph keeps its own properties. Returns
+/// `false`, changing nothing, otherwise.
+pub fn remove_empty_para(s: &mut Session, story: StoryRef, path: &wordcraft_doc::Path) -> Result<bool, CmdError> {
+    let empty = s.doc.para(story, path).is_some_and(|p| p.is_empty() && p.section.is_none());
+    if !empty || !has_next_para(s, story, path) {
+        return Ok(false);
+    }
+    s.doc.remove_block(story, path)?;
     Ok(true)
 }
 
@@ -248,13 +284,24 @@ pub fn paste_text(s: &mut Session, text: &str) -> Result<(), CmdError> {
 
 fn insert_text(s: &mut Session, text: &str, enter: bool) -> Result<(), CmdError> {
     let mut props = s.typing_props();
+    if s.sel.is_collapsed() {
+        s.sel = crate::Selection::caret(s.doc.past_field_ends(&s.sel.focus));
+    }
     // Content controls: a placeholder is replaced, locked ones refuse.
     if let Some(p) = controls::prepare_edit(s)? {
         props = p;
     }
+    // Pasted text is text: pending properties left by AutoCorrect don't give it a symbol's font (#2036).
+    if !enter {
+        props = props.without_symbol();
+    }
     delete_selection(s)?;
     // Typed text is new: never deleted, and not a formatting change of the text around it.
     props.fmt_change = None;
+    // Its direction comes from its own letters, as on screen, not from the run it's typed into:
+    // Latin typed into reopened Hebrew must not be saved as right-to-left (#1543). The DOCX
+    // writer marks the right-to-left pieces itself.
+    props.rtl = None;
     if s.doc.settings.track_changes {
         props.ins = Some(new_revision(s, RevisionKind::Insert));
         props.del = None;
@@ -271,12 +318,34 @@ fn insert_text(s: &mut Session, text: &str, enter: bool) -> Result<(), CmdError>
         first = false;
         let part = part.replace('\u{000B}', "\n");
         if !part.is_empty() {
+            let starts_para = direction_unset(s, &at);
             at = s.doc.insert_text(&at, &part, &props)?;
+            // Typing Arabic, Hebrew… as the first letters of a paragraph whose direction nothing
+            // sets makes it a right-to-left paragraph, so the caret and text start at the right
+            // margin. Paragraphs that already have letters, or a direction, keep theirs.
+            if starts_para
+                && let Ok(p) = s.doc.para_mut(at.story, &at.path)
+                && wordcraft_doc::bidi::first_strong_is_rtl(&p.text)
+            {
+                p.props.bidi = Some(true);
+                p.touch();
+            }
         }
     }
     s.sel = crate::Selection::caret(at);
     s.goal_x = None;
     Ok(())
+}
+
+/// Is the paragraph at `at` still without letters (empty, or only spaces, digits and
+/// punctuation), with no direction set on it, its style chain or the document defaults?
+fn direction_unset(s: &Session, at: &Pos) -> bool {
+    let Some(p) = s.doc.para_at(at) else { return false };
+    if p.props.bidi.is_some() || p.text.chars().any(char::is_alphabetic) || s.doc.styles.default_para.bidi.is_some() {
+        return false;
+    }
+    let style = p.props.style.as_deref().unwrap_or("Normal");
+    !s.doc.styles.chain(style).iter().any(|st| st.para.bidi.is_some())
 }
 
 /// Take a paragraph out of its list like Word does when Enter or Backspace ends a list: a
@@ -304,9 +373,14 @@ pub fn split_para(s: &mut Session, at: &Pos) -> Result<Pos, CmdError> {
 
 /// [`split_para`]; without `enter` an empty list item is split like any other paragraph.
 fn split_para_as(s: &mut Session, at: &Pos, enter: bool) -> Result<Pos, CmdError> {
-    // `num: 0` means "explicitly not in a list", so it isn't a list item.
+    // `num: 0` means "explicitly not in a list", so it isn't a list item. The list may come from
+    // the paragraph's style (List Number 2 in a Word file) rather than the paragraph itself.
     let (at_end, style, empty_list) = match s.doc.para_at(at) {
-        Some(p) => (at.off >= p.len(), p.props.style.clone(), p.props.numbering.filter(|n| enter && n.num != 0 && p.is_empty())),
+        Some(p) => (
+            at.off >= p.len(),
+            p.props.style.clone(),
+            p.props.numbering.or_else(|| s.doc.styles.resolve_para(&p.props).numbering).filter(|n| enter && n.num != 0 && p.is_empty()),
+        ),
         None => return Err(CmdError::Failed("no paragraph at caret".into())),
     };
     if let Some(n) = empty_list {
@@ -350,19 +424,27 @@ fn split_para_as(s: &mut Session, at: &Pos, enter: bool) -> Result<Pos, CmdError
 
 /// ISO-8601 timestamp (UTC, seconds) for `secs` since the Unix epoch.
 pub fn iso_from_unix_secs(secs: u64) -> String {
-    let (y, m, d) = civil_from_days((secs / 86_400) as i64);
+    use chrono::Datelike;
     let t = secs % 86_400;
-    format!("{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}Z", t / 3600, t / 60 % 60, t % 60)
+    let hms = format!("{:02}:{:02}:{:02}", t / 3600, t / 60 % 60, t % 60);
+    // Within chrono's range, read the date from it; past it, keep the proleptic Gregorian answer
+    // `civil_from_days` gives rather than falling back to the epoch.
+    let (y, m, d) = match i64::try_from(secs).ok().and_then(|s| chrono::DateTime::from_timestamp(s, 0)) {
+        Some(dt) => (i64::from(dt.year()), dt.month(), dt.day()),
+        None => civil_from_days((secs / 86_400) as i64),
+    };
+    // `{y:04}` rather than `%Y`, which writes a `+` before years past 9999.
+    format!("{y:04}-{m:02}-{d:02}T{hms}Z")
 }
 
 /// Seconds since the Unix epoch (UTC): the system clock, or the browser's on the web.
 pub fn now_unix() -> u64 {
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
     {
         std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
     }
     // `SystemTime::now()` panics on wasm32-unknown-unknown, so ask the browser's clock.
-    #[cfg(target_arch = "wasm32")]
+    #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
     {
         let ms = js_sys::Date::now();
         // Clamp a NaN or pre-epoch clock to 0 rather than fail.
@@ -375,18 +457,25 @@ pub fn now_iso() -> String {
     iso_from_unix_secs(now_unix())
 }
 
-/// Days since 1970-01-01 → (year, month, day) (Howard Hinnant's algorithm).
+/// Days since 1970-01-01 → (year, month, day).
+///
+/// `NaiveDate` only covers about ±262143 years, but this is reached by the system clock (and by
+/// [`iso_from_unix_secs`] for a `u64` seconds count past it), so it must stay exact for every
+/// `z`. The Gregorian calendar repeats every 400 years (146_097 days): chrono converts the day
+/// within its cycle and whole cycles go back into the year (an i128 so i64::MIN/MAX can't
+/// overflow). 1970-01-01 is `num_days_from_ce` 719_163, and 0..146_097 days from CE day 0 always
+/// fit chrono. The result matches the proleptic Gregorian count the old hand-rolled code gave.
 pub fn civil_from_days(z: i64) -> (i64, u32, u32) {
-    let z = z + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = z - era * 146_097;
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
-    (if m <= 2 { y + 1 } else { y }, m, d)
+    use chrono::Datelike;
+    let (cycles, rest) = (z.div_euclid(146_097), z.rem_euclid(146_097));
+    match i32::try_from(rest + 719_163).ok().and_then(chrono::NaiveDate::from_num_days_from_ce_opt) {
+        Some(d) => {
+            let y = i128::from(d.year()) + i128::from(cycles) * 400;
+            (i64::try_from(y).unwrap_or(if y < 0 { i64::MIN } else { i64::MAX }), d.month(), d.day())
+        }
+        // Unreachable: `rest + 719_163` is 719_163..865_259, always a valid CE day.
+        None => (1970, 1, 1),
+    }
 }
 
 /// Story given in params (`"story": "body"` / `{"part": 3}`), else the caret's.
@@ -394,9 +483,27 @@ pub fn story_param(s: &Session, v: &Value) -> StoryRef {
     v.get("story").and_then(|x| serde_json::from_value(x.clone()).ok()).unwrap_or(s.sel.focus.story)
 }
 
+/// The language (`w:lang`) of a paragraph's text: that of its first run with text (else of the
+/// paragraph mark), through styles and the document defaults. Sorting and number parsing follow it.
+pub fn para_lang(doc: &wordcraft_doc::Document, p: &wordcraft_doc::Paragraph) -> Option<String> {
+    let run = p.runs.iter().find(|r| r.len > 0).map(|r| &r.props).unwrap_or(&p.mark);
+    doc.styles.resolve_char(p.props.style.as_deref(), run).lang
+}
+
+/// The document's default text language (`w:docDefaults`, the Normal style).
+pub fn doc_lang(doc: &wordcraft_doc::Document) -> Option<String> {
+    doc.styles.resolve_char(None, &wordcraft_doc::CharProps::default()).lang
+}
+
+/// The language of text that names none: the document's default, else the editing language (a
+/// Polish interface writes Polish), else none (English). As AutoCorrect decides it.
+pub fn default_lang(s: &Session) -> Option<String> {
+    doc_lang(&s.doc).or_else(|| s.editing_lang.clone())
+}
+
 #[cfg(test)]
 mod iso_tests {
-    use super::iso_from_unix_secs;
+    use super::{civil_from_days, iso_from_unix_secs};
 
     #[test]
     fn formats_epoch_and_known_timestamps() {
@@ -409,5 +516,27 @@ mod iso_tests {
         assert_eq!(iso_from_unix_secs(1_709_164_800), "2024-02-29T00:00:00Z");
         assert_eq!(iso_from_unix_secs(951_782_400), "2000-02-29T00:00:00Z");
         assert_eq!(iso_from_unix_secs(1_735_689_599), "2024-12-31T23:59:59Z");
+    }
+
+    #[test]
+    fn formats_dates_outside_chronos_range() {
+        // Year 10000 is still inside chrono's range: a plain zero-padded year, no leading `+`.
+        assert_eq!(iso_from_unix_secs(253_402_300_800), "10000-01-01T00:00:00Z");
+        // Past chrono's range, keep the proleptic Gregorian date instead of the Unix epoch.
+        assert_eq!(iso_from_unix_secs(10_000_000_000_000), "318857-05-20T17:46:40Z");
+    }
+
+    #[test]
+    fn civil_from_days_is_exact_beyond_chronos_range() {
+        assert_eq!(civil_from_days(0), (1970, 1, 1));
+        assert_eq!(civil_from_days(20_734), (2026, 10, 8));
+        // Past `NaiveDate`'s ±262143 the 400-year cycles carry the year; values from the
+        // pre-chrono formula, both directions, both sides of the epoch.
+        assert_eq!(civil_from_days(95_026_602), (262_144, 1, 1));
+        assert_eq!(civil_from_days(99_000_000), (273_022, 10, 18));
+        assert_eq!(civil_from_days(-96_465_964), (-262_145, 3, 1));
+        assert_eq!(civil_from_days(-99_000_000), (-269_083, 3, 17));
+        // The extremes must not overflow or panic (i128 intermediates).
+        let _ = (civil_from_days(i64::MAX), civil_from_days(i64::MIN));
     }
 }

@@ -120,7 +120,7 @@ const DIB24_RGBA: [u8; 16] = [255, 0, 0, 255, 255, 255, 255, 255, 0, 0, 255, 255
 fn path_segs(item: &Item) -> (&Vec<Seg>, Option<[u8; 4]>, Option<([u8; 4], f32)>, bool) {
     match item {
         Item::Path { segs, fill, stroke, even_odd } => (segs, *fill, *stroke, *even_odd),
-        Item::Bitmap { .. } => panic!("expected a path"),
+        Item::Bitmap { .. } | Item::Text(_) => panic!("expected a path"),
     }
 }
 
@@ -468,7 +468,7 @@ fn emf_savedc_past_the_stack_cap_stops_the_parse() {
 fn canvas_stops_at_the_byte_budget() {
     // Two 128 MB bitmaps fit the budget; the third would exceed it and stops the canvas.
     let mut cv = Canvas::new();
-    let big = || Rgba { w: 1, h: 1, bottom_up: false, px: vec![0u8; MAX_BYTES / 2] };
+    let big = || Rgba { w: 1, h: 1, px: vec![0u8; MAX_BYTES / 2] };
     cv.bitmap([0.0, 0.0, 1.0, 1.0], big());
     cv.bitmap([0.0, 0.0, 1.0, 1.0], big());
     assert!(!cv.full());
@@ -866,11 +866,11 @@ fn emf_ext_pen_cosmetic_is_a_hairline_and_null_brush_draws_nothing() {
 
 #[test]
 fn flip_tolerates_a_short_pixel_buffer() {
-    let mut img = Rgba { w: 2, h: 2, bottom_up: false, px: vec![1u8; 7] };
+    let mut img = Rgba { w: 2, h: 2, px: vec![1u8; 7] };
     crate::dib::flip(&mut img, true, true);
     assert_eq!(img.px.len(), 7);
     // Three rows held of four: only the rows present swap (0 with 2).
-    let mut img = Rgba { w: 1, h: 4, bottom_up: false, px: (0u8..12).collect() };
+    let mut img = Rgba { w: 1, h: 4, px: (0u8..12).collect() };
     crate::dib::flip(&mut img, false, true);
     assert_eq!(img.px, [8, 9, 10, 11, 4, 5, 6, 7, 0, 1, 2, 3]);
 }
@@ -889,6 +889,43 @@ fn place_fits_the_frame_scales_strokes_and_drops_far_paths() {
     assert_eq!(placed.len(), 1);
     let crate::PlacedItem::Path { stroke, .. } = &placed[0] else { panic!("expected a path") };
     assert_eq!(stroke.map(|s| s.1), Some(8.0));
+}
+
+/// #1899: a crop keeps what the file says down to a sliver (a header's bar is 2.7% of a page-sized
+/// metafile), and junk sides give a finite part of the source with some area.
+#[test]
+fn crop_window_keeps_a_sliver_and_stays_finite() {
+    let [x, y, w, h] = crate::crop_window([0.0, 0.51771, 0.0, 0.45485]);
+    assert!(x == 0.0 && w == 1.0 && (y - 0.51771).abs() < 1e-6 && (h - 0.02744).abs() < 1e-5, "{y} {h}");
+    let pic = crate::Picture { width: 100.0, height: 1000.0, items: Vec::new() };
+    let tf = pic.fit(kurbo::Rect::new(0.0, 0.0, 100.0, 27.44), [0.0, 0.51771, 0.0, 0.45485]).unwrap();
+    // The kept band of the source (517.71..545.15) is the frame (0..27.44).
+    let top = tf * kurbo::Point::new(0.0, 517.71);
+    let bottom = tf * kurbo::Point::new(0.0, 545.15);
+    assert!(top.y.abs() < 1e-3 && (bottom.y - 27.44).abs() < 1e-3, "{top:?} {bottom:?}");
+    for c in [[f32::NAN, f32::INFINITY, -1.0, 2.0], [0.9; 4], [1.0, 1.0, 0.0, 0.0], [f32::MAX, f32::MIN, f32::NEG_INFINITY, 0.5]] {
+        let [x, y, w, h] = crate::crop_window(c);
+        assert!([x, y, w, h].iter().all(|v| v.is_finite()) && w > 0.0 && h > 0.0 && x + w <= 1.0 + 1e-9 && y + h <= 1.0 + 1e-9, "{c:?}");
+    }
+}
+
+/// The narrowest crop on the largest frame layout makes (4000 pt, far down a 22-inch page) still
+/// places the source's content: none of it is left out as far off the page.
+#[test]
+fn the_narrowest_crop_on_the_largest_frame_keeps_its_content() {
+    let pic = crate::Picture {
+        width: 100.0,
+        height: 100.0,
+        items: vec![
+            Item::Bitmap { rect: [0.0, 0.0, 100.0, 100.0], width: 1, height: 1, rgba: vec![255; 4] },
+            Item::Path { segs: vec![Seg::Move(0.0, 0.0), Seg::Line(100.0, 100.0)], fill: None, stroke: Some(([0, 0, 0, 255], 1.0)), even_odd: false },
+        ],
+    };
+    let frame = kurbo::Rect::new(1584.0, 1584.0, 5584.0, 5584.0);
+    // The last sliver, the first sliver, and sides that overlap.
+    for crop in [[1.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 1.0], [0.9999, 0.6, 0.5, 0.9999]] {
+        assert_eq!(pic.place(frame, crop).len(), 2, "{crop:?}");
+    }
 }
 
 #[test]
@@ -926,4 +963,93 @@ fn take_pixels_returns_only_drawable_bitmaps() {
     let pic = |width: f32, height: f32| crate::Picture { width, height, items: Vec::new() };
     assert!(pic(1.0, 2.0).has_size());
     assert!(!pic(0.0, 2.0).has_size() && !pic(f32::NAN, 2.0).has_size() && !pic(1.0, f32::INFINITY).has_size());
+}
+
+/// The rectangle a WMF RECTANGLE record covers, from its path's corners.
+fn rect_extent(item: &Item) -> (f32, f32, f32, f32) {
+    let (segs, ..) = path_segs(item);
+    let pts: Vec<(f32, f32)> = segs
+        .iter()
+        .filter_map(|s| match s {
+            Seg::Move(x, y) | Seg::Line(x, y) => Some((*x, *y)),
+            _ => None,
+        })
+        .collect();
+    let (xs, ys): (Vec<f32>, Vec<f32>) = pts.into_iter().unzip();
+    let lo = |v: &[f32]| v.iter().copied().fold(f32::MAX, f32::min);
+    let hi = |v: &[f32]| v.iter().copied().fold(f32::MIN, f32::max);
+    (lo(&xs), lo(&ys), hi(&xs), hi(&ys))
+}
+
+#[test]
+fn plain_anisotropic_wmf_without_a_viewport_fills_its_window() {
+    // Anisotropic, window 200 x 100, no viewport (a logo strip saved without a placeable header): the
+    // window is the target, not a 1 x 1 viewport that squeezes the picture to a point.
+    let recs = [
+        wrec(0x0103, &h16(8)),
+        wrec(0x020B, &cat(vec![h16(0), h16(0)])),
+        wrec(0x020C, &cat(vec![h16(100), h16(200)])),
+        wrec(0x041B, &cat(vec![h16(100), h16(200), h16(0), h16(0)])),
+    ];
+    let p = parse(&wmf(&recs, None)).unwrap();
+    assert_eq!((p.width, p.height), (200.0, 100.0));
+    let (x0, y0, x1, y1) = rect_extent(&p.items[0]);
+    assert!(close(x0, 0.0) && close(y0, 0.0) && close(x1, 200.0) && close(y1, 100.0), "{x0} {y0} {x1} {y1}");
+}
+
+#[test]
+fn placeable_wmf_window_records_replace_the_bounds() {
+    // The placeable bounds say 1440 square (72 points); the file then draws in a window centred on the
+    // origin, as a coat of arms saved by a drawing program does. The window maps onto the 72-point
+    // target, so the drawing fills it instead of being blown up around the bounds.
+    let recs = [
+        wrec(0x020C, &cat(vec![h16(2000), h16(2000)])),
+        wrec(0x020B, &cat(vec![h16(-1000), h16(-1000)])),
+        wrec(0x041B, &cat(vec![h16(1000), h16(1000), h16(-1000), h16(-1000)])),
+    ];
+    let p = parse(&wmf(&recs, Some([238, 539, 1678, 1979]))).unwrap();
+    assert_eq!((p.width, p.height), (72.0, 72.0));
+    let (x0, y0, x1, y1) = rect_extent(&p.items[0]);
+    assert!(close(x0, 0.0) && close(y0, 0.0) && close(x1, 72.0) && close(y1, 72.0), "{x0} {y0} {x1} {y1}");
+}
+
+#[test]
+fn placeable_wmf_keeps_its_target_when_the_window_changes_shape() {
+    // Bounds 600 x 300 (30 x 15 points), then a portrait window 100 x 200 for a bitmap-sized drawing:
+    // the drawing still fills the target (Word stretches it to the picture's box).
+    let recs = [wrec(0x0103, &h16(8)), wrec(0x020C, &cat(vec![h16(200), h16(100)])), wrec(0x041B, &cat(vec![h16(200), h16(100), h16(0), h16(0)]))];
+    let p = parse(&wmf(&recs, Some([0, 0, 600, 300]))).unwrap();
+    assert_eq!((p.width, p.height), (30.0, 15.0));
+    let (x0, y0, x1, y1) = rect_extent(&p.items[0]);
+    assert!(close(x0, 0.0) && close(y0, 0.0) && close(x1, 30.0) && close(y1, 15.0), "{x0} {y0} {x1} {y1}");
+}
+
+#[test]
+fn rop2_nop_draws_nothing_until_the_mode_changes() {
+    // A coat of arms that first draws its bounding rectangle with the R2_NOP mix mode (no output),
+    // then its shapes with R2_COPYPEN. Restoring a saved state brings R2_NOP back.
+    let rect = |n: i32| wrec(0x041B, &cat(vec![h16(n), h16(n), h16(0), h16(0)]));
+    let recs = [wrec(0x0104, &h16(11)), rect(100), wrec(0x001E, &[]), wrec(0x0104, &h16(13)), rect(50), wrec(0x0127, &h16(-1)), rect(20)];
+    let p = parse(&wmf(&recs, Some([0, 0, 100, 100]))).unwrap();
+    assert_eq!(p.items.len(), 1, "{:?}", p.items);
+    let (_, _, x1, y1) = rect_extent(&p.items[0]);
+    // 50 of 100 units in a 5-point picture.
+    assert!(close(x1, 2.5) && close(y1, 2.5), "{x1} {y1}");
+}
+
+#[test]
+fn plain_wmf_target_comes_from_a_window_that_was_read() {
+    // A window record too short to read, then the real one: the target is the real window, not the
+    // 1 x 1 default the short record left in place. A viewport origin set before it is kept.
+    let recs = [
+        wrec(0x0103, &h16(8)),
+        wrec(0x020D, &cat(vec![h16(0), h16(0)])),
+        wrec(0x020C, &[]),
+        wrec(0x020C, &cat(vec![h16(100), h16(200)])),
+        wrec(0x041B, &cat(vec![h16(100), h16(200), h16(0), h16(0)])),
+    ];
+    let p = parse(&wmf(&recs, None)).unwrap();
+    assert_eq!((p.width, p.height), (200.0, 100.0));
+    let (x0, y0, x1, y1) = rect_extent(&p.items[0]);
+    assert!(close(x0, 0.0) && close(y0, 0.0) && close(x1, 200.0) && close(y1, 100.0), "{x0} {y0} {x1} {y1}");
 }
